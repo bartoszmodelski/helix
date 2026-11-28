@@ -1,6 +1,6 @@
 use std::{
     cmp::Reverse,
-    collections::BinaryHeap,
+    collections::{BinaryHeap, VecDeque},
     net::{IpAddr, SocketAddr},
     sync::{
         Arc,
@@ -45,9 +45,11 @@ const JSON: (&str, &str) = ("content-type", "application/json");
 /// Answers written per turn. The rest wait a turn, so that a burst of answers does not
 /// keep the tile from reading new requests and releasing held ones on time.
 const MAX_ANSWERS_PER_TURN: usize = 32;
-/// Requests released to the auctioneer or timed out per turn. Releasing one is cheap, so
+/// Requests released to the auctioneer, and requests timed out, per turn. Either is cheap, so
 /// this is far above the answers: it only bounds a turn in which thousands fall due at once.
 const MAX_DUE_PER_TURN: usize = 256;
+/// Deadlines looked at per turn, those of requests already gone included.
+const MAX_DEADLINES_PER_TURN: usize = 4096;
 const LIMITER_PRUNE_INTERVAL_SECS: u64 = 60;
 
 /// A `get_header` request between its arrival and its answer. Dropping it unanswered
@@ -82,9 +84,12 @@ pub struct ProposerApiTile<A: Api> {
     head_slot: Slot,
     duty: Option<BuilderGetValidatorsResponseEntry>,
     headers: FxHashMap<u64, PendingHeader<A>>,
-    /// When each pending request next needs the tile, earliest first: the end of its hold
-    /// and its timeout. An entry outlives a request answered or dropped before it is due.
-    deadlines: BinaryHeap<Reverse<(Instant, u64)>>,
+    /// When each request's hold ends, earliest first. An entry outlives a request dropped
+    /// before it is due.
+    holds: BinaryHeap<Reverse<(Instant, u64)>>,
+    /// When each request times out, in arrival order, which is also the order they fall
+    /// due in. An entry outlives a request answered or dropped before then.
+    timeouts: VecDeque<(Instant, u64)>,
     /// The connections closed this turn, kept for its allocation.
     closed_now: FxHashSet<Token>,
     request_timeout: Duration,
@@ -117,7 +122,8 @@ impl<A: Api> ProposerApiTile<A> {
             head_slot: Slot::default(),
             duty: None,
             headers: FxHashMap::default(),
-            deadlines: BinaryHeap::new(),
+            holds: BinaryHeap::new(),
+            timeouts: VecDeque::new(),
             closed_now: FxHashSet::default(),
             request_timeout: API_REQUEST_TIMEOUT,
             prune: Repeater::every(flux::timing::Duration::from_secs(LIMITER_PRUNE_INTERVAL_SECS)),
@@ -222,8 +228,8 @@ impl<A: Api> ProposerApiTile<A> {
             guard,
             span: span.clone(),
         };
-        self.deadlines.push(Reverse((hold_until, pending.id)));
-        self.deadlines.push(Reverse((received + self.request_timeout, pending.id)));
+        self.holds.push(Reverse((hold_until, pending.id)));
+        self.timeouts.push_back((received + self.request_timeout, pending.id));
         self.headers.insert(pending.id, pending);
     }
 
@@ -231,39 +237,26 @@ impl<A: Api> ProposerApiTile<A> {
     /// those that waited too long. Returns whether any request moved on.
     fn advance_headers(&mut self) -> bool {
         let now = Instant::now();
-        let mut worked = false;
-        for _ in 0..MAX_DUE_PER_TURN {
-            let Some(&Reverse((at, id))) = self.deadlines.peek() else { break };
-            if now < at {
+        let released = self.release_held(now);
+        let timed_out = self.time_out(now);
+        released || timed_out
+    }
+
+    fn release_held(&mut self, now: Instant) -> bool {
+        let mut released = 0;
+        for _ in 0..MAX_DEADLINES_PER_TURN {
+            let Some(&Reverse((at, id))) = self.holds.peek() else { break };
+            if now < at || released == MAX_DUE_PER_TURN {
                 break;
             }
-            let Some(pending) = self.headers.get_mut(&id) else {
-                self.deadlines.pop();
-                continue;
-            };
-
+            self.holds.pop();
+            let Some(pending) = self.headers.get_mut(&id) else { continue };
+            // Held past its timeout: left for `time_out`, which answers it 408.
             if now.duration_since(pending.received) >= self.request_timeout {
-                // An answer that is already here must not lose to the timeout: the ones
-                // past this turn's budget are still queued.
-                if pending.hold_until.is_none() && !self.bids_rx.is_empty() {
-                    break;
-                }
-                self.deadlines.pop();
-                worked = true;
-                let Some(pending) = self.headers.remove(&id) else { continue };
-                let source_ip = pending.ip_addr.map(|ip| ip.to_string());
-                let path = Route::GetHeader.path();
-                count_request_timeout(source_ip.as_deref().unwrap_or("unknown"), &path);
-                self.server.respond(pending.responder, 408, &[], &[]);
                 continue;
             }
 
-            self.deadlines.pop();
-            // Before its timeout, the only entry of a request that is due is its hold's.
-            if pending.hold_until.is_none() {
-                continue;
-            }
-            worked = true;
+            released += 1;
             pending.hold_until = None;
             pending.guard.done_sleep = true;
             let reply = Reply::Tile { request: pending.id, tx: self.bids_tx.clone() };
@@ -279,7 +272,34 @@ impl<A: Api> ProposerApiTile<A> {
                 self.respond_error(pending.responder, ProposerApiError::InternalServerError);
             }
         }
-        worked
+        released > 0
+    }
+
+    fn time_out(&mut self, now: Instant) -> bool {
+        let mut timed_out = 0;
+        for _ in 0..MAX_DEADLINES_PER_TURN {
+            let Some(&(at, id)) = self.timeouts.front() else { break };
+            if now < at || timed_out == MAX_DUE_PER_TURN {
+                break;
+            }
+            let Some(pending) = self.headers.get(&id) else {
+                self.timeouts.pop_front();
+                continue;
+            };
+            // An answer that is already here must not lose to the timeout, and the ones
+            // past this turn's budget are still queued. Only the timeouts wait for them.
+            if pending.hold_until.is_none() && !self.bids_rx.is_empty() {
+                break;
+            }
+            self.timeouts.pop_front();
+            let Some(pending) = self.headers.remove(&id) else { continue };
+            timed_out += 1;
+            let source_ip = pending.ip_addr.map(|ip| ip.to_string());
+            let path = Route::GetHeader.path();
+            count_request_timeout(source_ip.as_deref().unwrap_or("unknown"), &path);
+            self.server.respond(pending.responder, 408, &[], &[]);
+        }
+        timed_out > 0
     }
 
     /// Answers the requests the auctioneer has replied to.
