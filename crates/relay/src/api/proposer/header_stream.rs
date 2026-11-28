@@ -66,7 +66,17 @@ impl<A: Api> ProposerApi<A> {
             preferences,
             ip_addr,
             ..
-        } = proposer_api.validate_header_request(&params, &headers, &terminating)?;
+        } = {
+            let (head_slot, duty) = proposer_api.curr_slot_info.slot_info();
+            let duty = duty.as_ref();
+            proposer_api.validate_header_request(
+                head_slot,
+                duty,
+                &params,
+                &headers,
+                &terminating,
+            )?
+        };
 
         proposer_api
             .api_provider

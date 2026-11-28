@@ -244,7 +244,7 @@ Builders/Proposers ===[HTTP]==> this --[sub_worker crossbeam]--> SubWorkers
 #### 10a. Proposer API tile (:API_TILE_PORT)
 
 **Spawned by**: `spine.start` via `attach_tile`, when `api_tile_port` is set
-**Runs on**: Flux tile thread, pinned to `cores.proposer_api` when set
+**Runs on**: Flux tile thread, pinned to `cores.proposer_api` (required with `api_tile_port`)
 **File**: `api/proposer/tile.rs`, `api/server.rs`
 
 Serves proposer routes over Flux's poll-driven HTTP listener instead of tokio. Routes
@@ -260,6 +260,7 @@ ids and request metrics.
 ```
 Proposers ===[HTTP]==> this --[event crossbeam]----------> Auctioneer
                             <--[header_replies crossbeam]--
+Housekeeper --[spine: SlotMsg]--> this (head slot and next duty, kept locally)
 ```
 
 #### 11. Admin Server (:4050)

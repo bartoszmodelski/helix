@@ -309,13 +309,14 @@ async fn run(
                 &config.router_config,
                 proposer_api,
                 terminating.clone(),
+                slot_events.clone(),
             );
-            attach_tile(tile, spine, match config.cores.proposer_api {
-                Some(core) => config.cores.tile(core),
-                None => {
-                    TileConfig::background(None, Some(flux::timing::Duration::from_micros(100)))
-                }
-            });
+            // Every get_header on this port waits on this one loop, so it gets a core.
+            let core = config
+                .cores
+                .proposer_api
+                .expect("cores.proposer_api must be set when api_tile_port is set");
+            attach_tile(tile, spine, config.cores.tile(core));
         }
 
         if config.is_registration_instance {

@@ -46,6 +46,9 @@ const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 /// is back the pool is a connection short, so it is reopened well within a simulation's
 /// run time.
 const RECONNECT_INTERVAL: Duration = Duration::from_millis(200);
+/// Requests encoded and sent per turn. Encoding a block takes long enough that a burst of
+/// them would otherwise hold up the answers, failures and sync polls of every simulator.
+const MAX_JOBS_PER_TURN: usize = 4;
 const JSON: &str = "application/json";
 const OCTET_STREAM: &str = "application/octet-stream";
 
@@ -182,7 +185,8 @@ impl SimulatorTile {
     /// One turn of the tile; returns whether it did anything.
     fn poll(&mut self) -> bool {
         let mut worked = false;
-        while let Ok(job) = self.jobs.try_recv() {
+        for _ in 0..MAX_JOBS_PER_TURN {
+            let Ok(job) = self.jobs.try_recv() else { break };
             worked = true;
             match job {
                 SimJob::Validate { id, req, timer } => self.start_validation(id, req, timer),

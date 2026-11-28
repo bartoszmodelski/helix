@@ -255,8 +255,7 @@ pub struct CoresConfig {
     /// and sleeps between turns.
     #[serde(default)]
     pub simulator: Option<usize>,
-    /// Core for the tile serving the proposer API on `api_tile_port`. Unset, it runs
-    /// unpinned and sleeps between turns.
+    /// Core for the tile serving the proposer API on `api_tile_port`; required with it.
     #[serde(default)]
     pub proposer_api: Option<usize>,
     #[serde(default = "default_bool::<true>")]

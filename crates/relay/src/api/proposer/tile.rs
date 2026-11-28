@@ -4,18 +4,24 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
 };
 
 use crossbeam_channel::{Receiver, Sender};
-use flux::{spine::SpineAdapter, tile::Tile};
+use flux::{
+    spine::SpineAdapter,
+    tile::Tile,
+    timing::{Duration, Instant, Repeater},
+};
 use flux_network::Token;
+use flux_utils::SharedVector;
 use helix_common::{
     GetHeaderTrace, Route, RouterConfig,
-    api::proposer_api::GetHeaderParams,
+    api::{builder_api::BuilderGetValidatorsResponseEntry, proposer_api::GetHeaderParams},
     decoder::{Encoding, HEADER_SSZ},
     utils::extract_request_id,
 };
+use helix_types::Slot;
+use rustc_hash::FxHashMap;
 use ssz::Encode;
 use tracing::{debug, error, info_span};
 
@@ -32,10 +38,15 @@ use crate::{
         service::API_REQUEST_TIMEOUT,
     },
     auctioneer::{GetHeaderResult, Reply},
-    spine::messages::ProposerRequestKind,
+    housekeeper::SlotUpdate,
+    spine::messages::{ProposerRequestKind, SlotMsg},
 };
 
 const JSON: (&str, &str) = ("content-type", "application/json");
+/// Answers written per turn. The rest wait a turn, so that a burst of answers does not
+/// keep the tile from reading new requests and releasing held ones on time.
+const MAX_ANSWERS_PER_TURN: usize = 32;
+const LIMITER_PRUNE_INTERVAL_SECS: u64 = 60;
 
 /// A `get_header` request between its arrival and its answer. Dropping it unanswered
 /// reports the caller as having given up, through `guard`.
@@ -56,6 +67,14 @@ struct PendingHeader<A: Api> {
     span: tracing::Span,
 }
 
+impl<A: Api> PendingHeader<A> {
+    /// When the request next needs the tile: at the end of its hold or at its timeout.
+    fn due(&self, timeout: Duration) -> Instant {
+        let timeout = self.received + timeout;
+        self.hold_until.map_or(timeout, |hold| hold.min(timeout))
+    }
+}
+
 /// Serves the proposer API without the async runtime.
 pub struct ProposerApiTile<A: Api> {
     server: ApiServer,
@@ -63,7 +82,19 @@ pub struct ProposerApiTile<A: Api> {
     closed: Vec<Token>,
     api: Arc<ProposerApi<A>>,
     terminating: Arc<AtomicBool>,
-    headers: Vec<PendingHeader<A>>,
+    slot_events: Arc<SharedVector<SlotUpdate>>,
+    /// The chain's head and the duty of the slot after it, as the housekeeper last
+    /// announced them.
+    head_slot: Slot,
+    duty: Option<BuilderGetValidatorsResponseEntry>,
+    headers: FxHashMap<u64, PendingHeader<A>>,
+    /// The earliest moment a pending request is due; until then none is looked at.
+    next_due: Option<Instant>,
+    /// The requests due this turn, kept for its allocation.
+    due: Vec<u64>,
+    request_timeout: Duration,
+    prune: Repeater,
+    prune_due: bool,
     next_id: u64,
     bids_tx: Sender<(u64, GetHeaderResult)>,
     bids_rx: Receiver<(u64, GetHeaderResult)>,
@@ -76,6 +107,7 @@ impl<A: Api> ProposerApiTile<A> {
         config: &RouterConfig,
         api: Arc<ProposerApi<A>>,
         terminating: Arc<AtomicBool>,
+        slot_events: Arc<SharedVector<SlotUpdate>>,
     ) -> Self {
         let served = [(Route::Status, "GET"), (Route::GetHeader, "GET")];
         // Unbounded, but it never holds more than one answer per pending request.
@@ -86,7 +118,15 @@ impl<A: Api> ProposerApiTile<A> {
             closed: Vec::new(),
             api,
             terminating,
-            headers: Vec::new(),
+            slot_events,
+            head_slot: Slot::default(),
+            duty: None,
+            headers: FxHashMap::default(),
+            next_due: None,
+            due: Vec::new(),
+            request_timeout: API_REQUEST_TIMEOUT.into(),
+            prune: Repeater::every(Duration::from_secs(LIMITER_PRUNE_INTERVAL_SECS)),
+            prune_due: false,
             next_id: 0,
             bids_tx,
             bids_rx,
@@ -102,6 +142,12 @@ impl<A: Api> ProposerApiTile<A> {
         } else {
             self.server.respond_text(responder, status, &error.to_string());
         }
+    }
+
+    fn on_slot_msg(&mut self, msg: SlotMsg) {
+        let Some(update) = self.slot_events.get(msg.slot_update_id) else { return };
+        self.head_slot = update.bid_slot.as_u64().saturating_sub(1).into();
+        self.duty.clone_from(&update.registration_data);
     }
 
     fn on_get_header(&mut self, request: Inbound) {
@@ -126,11 +172,16 @@ impl<A: Api> ProposerApiTile<A> {
             &request.headers,
         );
 
-        let validated =
-            match self.api.validate_header_request(&params, &request.headers, &self.terminating) {
-                Ok(validated) => validated,
-                Err(error) => return self.respond_error(request.responder, error),
-            };
+        let validated = match self.api.validate_header_request(
+            self.head_slot,
+            self.duty.as_ref(),
+            &params,
+            &request.headers,
+            &self.terminating,
+        ) {
+            Ok(validated) => validated,
+            Err(error) => return self.respond_error(request.responder, error),
+        };
 
         let mut guard = self.api.timeout_guard(
             &params,
@@ -155,8 +206,9 @@ impl<A: Api> ProposerApiTile<A> {
         }
 
         let received = Instant::now();
+        let hold_until = received + Duration::from(validated.sleep_time.unwrap_or_default());
         self.next_id += 1;
-        self.headers.push(PendingHeader {
+        let pending = PendingHeader {
             id: self.next_id,
             responder: request.responder,
             params,
@@ -171,35 +223,38 @@ impl<A: Api> ProposerApiTile<A> {
                 ..Default::default()
             },
             received,
-            hold_until: Some(received + validated.sleep_time.unwrap_or_default()),
+            hold_until: Some(hold_until),
             guard,
             span: span.clone(),
-        });
+        };
+        let due = pending.due(self.request_timeout);
+        self.next_due = Some(self.next_due.map_or(due, |next| next.min(due)));
+        self.headers.insert(pending.id, pending);
     }
 
     /// Asks the auctioneer for the requests whose hold has ended and answers 408 to
     /// those that waited too long. Returns whether any request moved on.
     fn advance_headers(&mut self) -> bool {
         let now = Instant::now();
-        let mut worked = false;
-        let mut i = 0;
-        while i < self.headers.len() {
-            let pending = &mut self.headers[i];
-            if now.duration_since(pending.received) >= API_REQUEST_TIMEOUT {
-                let pending = self.headers.swap_remove(i);
+        if self.next_due.is_none_or(|due| now < due) {
+            return false;
+        }
+        let timeout = self.request_timeout;
+        let mut due = std::mem::take(&mut self.due);
+        due.extend(self.headers.values().filter(|p| p.due(timeout) <= now).map(|p| p.id));
+        // In the order they arrived.
+        due.sort_unstable();
+        for id in due.drain(..) {
+            let Some(pending) = self.headers.get_mut(&id) else { continue };
+            if now.saturating_sub(pending.received) >= timeout {
+                let Some(pending) = self.headers.remove(&id) else { continue };
                 let source_ip = pending.ip_addr.map(|ip| ip.to_string());
                 let path = Route::GetHeader.path();
                 count_request_timeout(source_ip.as_deref().unwrap_or("unknown"), &path);
                 self.server.respond(pending.responder, 408, &[], &[]);
-                worked = true;
-                continue;
-            }
-            if pending.hold_until.is_none_or(|until| now < until) {
-                i += 1;
                 continue;
             }
 
-            worked = true;
             pending.hold_until = None;
             pending.guard.done_sleep = true;
             let reply = Reply::Tile { request: pending.id, tx: self.bids_tx.clone() };
@@ -208,28 +263,26 @@ impl<A: Api> ProposerApiTile<A> {
                 .span
                 .in_scope(|| handle.get_header_reply(pending.params, pending.is_mev_boost, reply));
             if sent.is_err() {
-                let mut pending = self.headers.swap_remove(i);
+                let Some(mut pending) = self.headers.remove(&id) else { continue };
                 let _entered = pending.span.enter();
                 error!("failed to send get_header to auctioneer");
                 pending.guard.timed_out = None;
                 self.respond_error(pending.responder, ProposerApiError::InternalServerError);
-                continue;
             }
-            i += 1;
         }
-        worked
+        self.due = due;
+        self.next_due = self.headers.values().map(|pending| pending.due(timeout)).min();
+        true
     }
 
     /// Answers the requests the auctioneer has replied to.
     fn deliver_bids(&mut self) -> bool {
         let mut worked = false;
-        while let Ok((id, result)) = self.bids_rx.try_recv() {
+        for _ in 0..MAX_ANSWERS_PER_TURN {
+            let Ok((id, result)) = self.bids_rx.try_recv() else { break };
             worked = true;
             // Gone if its caller disconnected or timed out meanwhile.
-            let Some(i) = self.headers.iter().position(|pending| pending.id == id) else {
-                continue;
-            };
-            let mut pending = self.headers.swap_remove(i);
+            let Some(mut pending) = self.headers.remove(&id) else { continue };
             let span = pending.span.clone();
             let _entered = span.enter();
             pending.guard.done_fetch = true;
@@ -249,7 +302,7 @@ impl<A: Api> ProposerApiTile<A> {
                 pending.user_agent,
                 pending.ip_addr,
                 pending.peer,
-                &mut self.signed,
+                Some(&mut self.signed),
             );
             match pending.encoding {
                 Encoding::Json => match serde_json::to_vec(&signed_bid) {
@@ -269,7 +322,15 @@ impl<A: Api> ProposerApiTile<A> {
 }
 
 impl<A: Api> Tile<HelixSpine> for ProposerApiTile<A> {
+    fn try_init(&mut self, _adapter: &mut SpineAdapter<HelixSpine>) -> bool {
+        // What the housekeeper announced before this tile was listening.
+        (self.head_slot, self.duty) = self.api.curr_slot_info.slot_info();
+        true
+    }
+
     fn loop_body(&mut self, adapter: &mut SpineAdapter<HelixSpine>) {
+        adapter.consume(|msg: SlotMsg, _| self.on_slot_msg(msg));
+
         let mut requests = std::mem::take(&mut self.requests);
         let mut worked = self.server.poll(&mut requests, &mut self.closed);
         for request in requests.drain(..) {
@@ -287,7 +348,7 @@ impl<A: Api> Tile<HelixSpine> for ProposerApiTile<A> {
         // After the requests: one that arrived with its connection's close is pending
         // by now, and must be dropped as abandoned rather than served to nobody.
         for token in self.closed.drain(..) {
-            self.headers.retain(|pending| pending.responder.token != token);
+            self.headers.retain(|_, pending| pending.responder.token != token);
         }
 
         // Answers first: one that is already here must not lose to the timeout sweep.
@@ -295,6 +356,22 @@ impl<A: Api> Tile<HelixSpine> for ProposerApiTile<A> {
         worked |= self.advance_headers();
         if worked {
             adapter.mark_work();
+        }
+
+        // The sweep stops the tile for as long as it takes, so it waits for a moment
+        // with nobody held.
+        self.prune_due |= self.prune.fired();
+        if self.prune_due && self.headers.is_empty() {
+            self.prune_due = false;
+            self.server.prune_limiters();
+        }
+    }
+
+    fn teardown(mut self, _adapter: &mut SpineAdapter<HelixSpine>) {
+        // The callers still held are cut off by the shutdown: they did not give up, and
+        // are not reported as if they had.
+        for (_, pending) in self.headers.drain() {
+            std::mem::forget(pending.guard);
         }
     }
 }

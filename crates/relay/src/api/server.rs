@@ -3,7 +3,7 @@
 use std::{
     net::{IpAddr, SocketAddr},
     num::NonZeroU32,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use flux_network::{
@@ -24,7 +24,6 @@ const X_REQUEST_ID: &str = "x-request-id";
 const TEXT: (&str, &str) = ("content-type", "text/plain; charset=utf-8");
 /// Headers a handler may add to a response, besides the request id.
 const MAX_RESPONSE_HEADERS: usize = 3;
-const LIMITER_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 
 struct ServedRoute {
     route: Route,
@@ -76,7 +75,6 @@ pub(crate) struct ApiServer {
     peers: FxHashMap<Token, SocketAddr>,
     /// Requests refused while the listener was borrowed for delivery.
     refused: Vec<(Responder, u16, u64)>,
-    next_prune: Instant,
 }
 
 impl ApiServer {
@@ -123,14 +121,7 @@ impl ApiServer {
             info!(%addr, name, "API tile listening");
         }
 
-        Self {
-            net,
-            http,
-            routes,
-            peers: FxHashMap::default(),
-            refused: Vec::new(),
-            next_prune: Instant::now() + LIMITER_PRUNE_INTERVAL,
-        }
+        Self { net, http, routes, peers: FxHashMap::default(), refused: Vec::new() }
     }
 
     /// Appends the requests that arrived to `requests` and answers those no route
@@ -222,14 +213,15 @@ impl ApiServer {
             }
         }
 
-        let now = Instant::now();
-        if now >= self.next_prune {
-            self.next_prune = now + LIMITER_PRUNE_INTERVAL;
-            for limiter in self.routes.iter().filter_map(|served| served.limiter.as_ref()) {
-                limiter.retain_recent();
-            }
-        }
         worked
+    }
+
+    /// Forgets the callers the rate limits no longer count. Takes time in proportion to
+    /// the callers seen, so it is the owner's to call at a quiet moment.
+    pub fn prune_limiters(&mut self) {
+        for limiter in self.routes.iter().filter_map(|served| served.limiter.as_ref()) {
+            limiter.retain_recent();
+        }
     }
 
     /// Answers a request with up to [`MAX_RESPONSE_HEADERS`] headers of the caller's.
@@ -299,6 +291,7 @@ mod tests {
     use std::{
         io::{ErrorKind, Read, Write},
         net::{TcpListener, TcpStream},
+        time::Instant,
     };
 
     use helix_common::{RateLimitInfo, RouteInfo};

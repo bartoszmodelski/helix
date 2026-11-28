@@ -22,7 +22,7 @@ use flux::{
 };
 use helix_common::{
     GET_HEADER_REQUEST_CUTOFF_MS, GetHeaderTrace, RequestTimings, ValidatorPreferences,
-    api::proposer_api::GetHeaderParams,
+    api::{builder_api::BuilderGetValidatorsResponseEntry, proposer_api::GetHeaderParams},
     api_provider::{ApiProvider, TimingResult, header_ip_addr},
     chain_info::ChainInfo,
     decoder::{Encoding, HEADER_SSZ},
@@ -31,7 +31,7 @@ use helix_common::{
     spawn_tracked,
     utils::{extract_request_id, utcnow_ms, utcnow_ns},
 };
-use helix_types::{BuilderBid, ForkName, GetHeaderResponse, SignedBuilderBid};
+use helix_types::{BuilderBid, ForkName, GetHeaderResponse, SignedBuilderBid, Slot};
 use http::{
     HeaderValue,
     header::{CONTENT_TYPE, USER_AGENT},
@@ -63,8 +63,12 @@ pub(super) struct ValidatedHeaderRequest {
 }
 
 impl<A: Api> ProposerApi<A> {
+    /// `head_slot` and `duty` are the chain's head and the duty of the slot after it, as
+    /// the housekeeper last announced them.
     pub(super) fn validate_header_request(
         &self,
+        head_slot: Slot,
+        duty: Option<&BuilderGetValidatorsResponseEntry>,
         params: &GetHeaderParams,
         headers: &HeaderMap,
         terminating: &AtomicBool,
@@ -73,7 +77,6 @@ impl<A: Api> ProposerApi<A> {
             return Err(ProposerApiError::ServiceUnavailableError);
         }
 
-        let (head_slot, duty) = self.curr_slot_info.slot_info();
         let bid_slot = head_slot.as_u64() + 1;
 
         if params.slot != bid_slot {
@@ -112,7 +115,7 @@ impl<A: Api> ProposerApi<A> {
             sleep_time,
             timeout_ms,
             timeout_source,
-            preferences: duty.entry.preferences,
+            preferences: duty.entry.preferences.clone(),
             ip_addr,
         })
     }
@@ -160,7 +163,7 @@ impl<A: Api> ProposerApi<A> {
         user_agent: Option<String>,
         ip_addr: Option<IpAddr>,
         peer: SocketAddr,
-        signed: &mut SignedBidCache,
+        signed: Option<&mut SignedBidCache>,
     ) -> (GetHeaderResponse, ForkName) {
         let now_ns = utcnow_ns();
         trace.best_bid_fetched = now_ns;
@@ -206,9 +209,11 @@ impl<A: Api> ProposerApi<A> {
         let payload_and_blobs = bid.payload_and_blobs();
         let bid_data = bid.bid_data_ref().to_owned();
         let key = bid.receive_ns().map(|received| (bid_block_hash, value, received));
-        let signed_bid = signed.get_or_sign(key, || {
-            resign_builder_bid(bid.into_builder_bid_slow(), &self.signing_context, fork)
-        });
+        let sign = || resign_builder_bid(bid.into_builder_bid_slow(), &self.signing_context, fork);
+        let signed_bid = match signed {
+            Some(cache) => cache.get_or_sign(key, sign),
+            None => sign(),
+        };
 
         if self.relay_config.gossip_payload_on_header && is_mev_boost {
             let ip_gate =
@@ -277,7 +282,17 @@ impl<A: Api> ProposerApi<A> {
             timeout_source,
             ip_addr,
             ..
-        } = proposer_api.validate_header_request(&params, &headers, &terminating)?;
+        } = {
+            let (head_slot, duty) = proposer_api.curr_slot_info.slot_info();
+            let duty = duty.as_ref();
+            proposer_api.validate_header_request(
+                head_slot,
+                duty,
+                &params,
+                &headers,
+                &terminating,
+            )?
+        };
 
         let trace = GetHeaderTrace {
             receive: timings.on_receive_ns,
@@ -335,7 +350,7 @@ impl<A: Api> ProposerApi<A> {
             user_agent,
             ip_addr,
             peer,
-            &mut SignedBidCache::default(),
+            None,
         );
 
         timing_guard.done_fetch = true;
