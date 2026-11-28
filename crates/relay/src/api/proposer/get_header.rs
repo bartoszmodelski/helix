@@ -21,7 +21,7 @@ use flux::{
     utils::ArrayStr,
 };
 use helix_common::{
-    GET_HEADER_REQUEST_CUTOFF_MS, GetHeaderTrace, RequestTimings, ValidatorPreferences,
+    GET_HEADER_REQUEST_CUTOFF_MS, GetHeaderTrace, RequestTimings,
     api::{builder_api::BuilderGetValidatorsResponseEntry, proposer_api::GetHeaderParams},
     api_provider::{ApiProvider, TimingResult, header_ip_addr},
     chain_info::ChainInfo,
@@ -58,7 +58,6 @@ pub(super) struct ValidatedHeaderRequest {
     pub sleep_time: Option<Duration>,
     pub timeout_ms: Option<u64>,
     pub timeout_source: &'static str,
-    pub preferences: ValidatorPreferences,
     pub ip_addr: Option<IpAddr>,
 }
 
@@ -115,7 +114,6 @@ impl<A: Api> ProposerApi<A> {
             sleep_time,
             timeout_ms,
             timeout_source,
-            preferences: duty.entry.preferences.clone(),
             ip_addr,
         })
     }

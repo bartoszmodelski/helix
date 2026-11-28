@@ -1,17 +1,16 @@
 use std::{
+    cmp::Reverse,
+    collections::BinaryHeap,
     net::{IpAddr, SocketAddr},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use crossbeam_channel::{Receiver, Sender};
-use flux::{
-    spine::SpineAdapter,
-    tile::Tile,
-    timing::{Duration, Instant, Repeater},
-};
+use flux::{spine::SpineAdapter, tile::Tile, timing::Repeater};
 use flux_network::Token;
 use flux_utils::SharedVector;
 use helix_common::{
@@ -21,7 +20,7 @@ use helix_common::{
     utils::extract_request_id,
 };
 use helix_types::Slot;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use ssz::Encode;
 use tracing::{debug, error, info_span};
 
@@ -46,6 +45,9 @@ const JSON: (&str, &str) = ("content-type", "application/json");
 /// Answers written per turn. The rest wait a turn, so that a burst of answers does not
 /// keep the tile from reading new requests and releasing held ones on time.
 const MAX_ANSWERS_PER_TURN: usize = 32;
+/// Requests released to the auctioneer or timed out per turn. Releasing one is cheap, so
+/// this is far above the answers: it only bounds a turn in which thousands fall due at once.
+const MAX_DUE_PER_TURN: usize = 256;
 const LIMITER_PRUNE_INTERVAL_SECS: u64 = 60;
 
 /// A `get_header` request between its arrival and its answer. Dropping it unanswered
@@ -67,14 +69,6 @@ struct PendingHeader<A: Api> {
     span: tracing::Span,
 }
 
-impl<A: Api> PendingHeader<A> {
-    /// When the request next needs the tile: at the end of its hold or at its timeout.
-    fn due(&self, timeout: Duration) -> Instant {
-        let timeout = self.received + timeout;
-        self.hold_until.map_or(timeout, |hold| hold.min(timeout))
-    }
-}
-
 /// Serves the proposer API without the async runtime.
 pub struct ProposerApiTile<A: Api> {
     server: ApiServer,
@@ -88,10 +82,11 @@ pub struct ProposerApiTile<A: Api> {
     head_slot: Slot,
     duty: Option<BuilderGetValidatorsResponseEntry>,
     headers: FxHashMap<u64, PendingHeader<A>>,
-    /// The earliest moment a pending request is due; until then none is looked at.
-    next_due: Option<Instant>,
-    /// The requests due this turn, kept for its allocation.
-    due: Vec<u64>,
+    /// When each pending request next needs the tile, earliest first: the end of its hold
+    /// and its timeout. An entry outlives a request answered or dropped before it is due.
+    deadlines: BinaryHeap<Reverse<(Instant, u64)>>,
+    /// The connections closed this turn, kept for its allocation.
+    closed_now: FxHashSet<Token>,
     request_timeout: Duration,
     prune: Repeater,
     prune_due: bool,
@@ -122,10 +117,10 @@ impl<A: Api> ProposerApiTile<A> {
             head_slot: Slot::default(),
             duty: None,
             headers: FxHashMap::default(),
-            next_due: None,
-            due: Vec::new(),
-            request_timeout: API_REQUEST_TIMEOUT.into(),
-            prune: Repeater::every(Duration::from_secs(LIMITER_PRUNE_INTERVAL_SECS)),
+            deadlines: BinaryHeap::new(),
+            closed_now: FxHashSet::default(),
+            request_timeout: API_REQUEST_TIMEOUT,
+            prune: Repeater::every(flux::timing::Duration::from_secs(LIMITER_PRUNE_INTERVAL_SECS)),
             prune_due: false,
             next_id: 0,
             bids_tx,
@@ -206,7 +201,7 @@ impl<A: Api> ProposerApiTile<A> {
         }
 
         let received = Instant::now();
-        let hold_until = received + Duration::from(validated.sleep_time.unwrap_or_default());
+        let hold_until = received + validated.sleep_time.unwrap_or_default();
         self.next_id += 1;
         let pending = PendingHeader {
             id: self.next_id,
@@ -227,8 +222,8 @@ impl<A: Api> ProposerApiTile<A> {
             guard,
             span: span.clone(),
         };
-        let due = pending.due(self.request_timeout);
-        self.next_due = Some(self.next_due.map_or(due, |next| next.min(due)));
+        self.deadlines.push(Reverse((hold_until, pending.id)));
+        self.deadlines.push(Reverse((received + self.request_timeout, pending.id)));
         self.headers.insert(pending.id, pending);
     }
 
@@ -236,17 +231,25 @@ impl<A: Api> ProposerApiTile<A> {
     /// those that waited too long. Returns whether any request moved on.
     fn advance_headers(&mut self) -> bool {
         let now = Instant::now();
-        if self.next_due.is_none_or(|due| now < due) {
-            return false;
-        }
-        let timeout = self.request_timeout;
-        let mut due = std::mem::take(&mut self.due);
-        due.extend(self.headers.values().filter(|p| p.due(timeout) <= now).map(|p| p.id));
-        // In the order they arrived.
-        due.sort_unstable();
-        for id in due.drain(..) {
-            let Some(pending) = self.headers.get_mut(&id) else { continue };
-            if now.saturating_sub(pending.received) >= timeout {
+        let mut worked = false;
+        for _ in 0..MAX_DUE_PER_TURN {
+            let Some(&Reverse((at, id))) = self.deadlines.peek() else { break };
+            if now < at {
+                break;
+            }
+            let Some(pending) = self.headers.get_mut(&id) else {
+                self.deadlines.pop();
+                continue;
+            };
+
+            if now.duration_since(pending.received) >= self.request_timeout {
+                // An answer that is already here must not lose to the timeout: the ones
+                // past this turn's budget are still queued.
+                if pending.hold_until.is_none() && !self.bids_rx.is_empty() {
+                    break;
+                }
+                self.deadlines.pop();
+                worked = true;
                 let Some(pending) = self.headers.remove(&id) else { continue };
                 let source_ip = pending.ip_addr.map(|ip| ip.to_string());
                 let path = Route::GetHeader.path();
@@ -255,6 +258,12 @@ impl<A: Api> ProposerApiTile<A> {
                 continue;
             }
 
+            self.deadlines.pop();
+            // Before its timeout, the only entry of a request that is due is its hold's.
+            if pending.hold_until.is_none() {
+                continue;
+            }
+            worked = true;
             pending.hold_until = None;
             pending.guard.done_sleep = true;
             let reply = Reply::Tile { request: pending.id, tx: self.bids_tx.clone() };
@@ -270,9 +279,7 @@ impl<A: Api> ProposerApiTile<A> {
                 self.respond_error(pending.responder, ProposerApiError::InternalServerError);
             }
         }
-        self.due = due;
-        self.next_due = self.headers.values().map(|pending| pending.due(timeout)).min();
-        true
+        worked
     }
 
     /// Answers the requests the auctioneer has replied to.
@@ -322,8 +329,14 @@ impl<A: Api> ProposerApiTile<A> {
 }
 
 impl<A: Api> Tile<HelixSpine> for ProposerApiTile<A> {
+    fn on_attach(&mut self, adapter: &mut SpineAdapter<HelixSpine>) {
+        // Otherwise the tile starts listening at its first turn, and loses a slot
+        // announced between the seed below and then.
+        adapter.subscribe_broadcast::<SlotMsg>();
+    }
+
     fn try_init(&mut self, _adapter: &mut SpineAdapter<HelixSpine>) -> bool {
-        // What the housekeeper announced before this tile was listening.
+        // What the housekeeper announced before this tile was attached.
         (self.head_slot, self.duty) = self.api.curr_slot_info.slot_info();
         true
     }
@@ -347,8 +360,11 @@ impl<A: Api> Tile<HelixSpine> for ProposerApiTile<A> {
         self.requests = requests;
         // After the requests: one that arrived with its connection's close is pending
         // by now, and must be dropped as abandoned rather than served to nobody.
-        for token in self.closed.drain(..) {
-            self.headers.retain(|_, pending| pending.responder.token != token);
+        if !self.closed.is_empty() {
+            self.closed_now.extend(self.closed.drain(..));
+            let closed = &self.closed_now;
+            self.headers.retain(|_, pending| !closed.contains(&pending.responder.token));
+            self.closed_now.clear();
         }
 
         // Answers first: one that is already here must not lose to the timeout sweep.

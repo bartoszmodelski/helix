@@ -57,26 +57,25 @@ impl<A: Api> ProposerApi<A> {
 
         let config = &proposer_api.relay_config.header_stream;
 
+        let (head_slot, duty) = proposer_api.curr_slot_info.slot_info();
         let ValidatedHeaderRequest {
             ms_into_slot,
             validation_complete_ns,
             user_agent,
             is_mev_boost,
             timeout_ms,
-            preferences,
             ip_addr,
             ..
-        } = {
-            let (head_slot, duty) = proposer_api.curr_slot_info.slot_info();
-            let duty = duty.as_ref();
-            proposer_api.validate_header_request(
-                head_slot,
-                duty,
-                &params,
-                &headers,
-                &terminating,
-            )?
-        };
+        } = proposer_api.validate_header_request(
+            head_slot,
+            duty.as_ref(),
+            &params,
+            &headers,
+            &terminating,
+        )?;
+        // Validation refuses a slot without a duty.
+        let Some(duty) = duty else { return Err(ProposerApiError::ProposerNotRegistered) };
+        let preferences = duty.entry.preferences;
 
         proposer_api
             .api_provider
